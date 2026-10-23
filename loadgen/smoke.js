@@ -1,14 +1,17 @@
 import http from 'k6/http';
+import { Counter } from 'k6/metrics';
 import { check, sleep } from 'k6';
 
 const baseUrl = __ENV.TARGET_URL || 'http://shop:8088';
 const products = ['aurora-mug', 'signal-notebook', 'orbit-lamp', 'cloud-socks', 'field-bag', 'night-hoodie'];
+const duplicateCharges = new Counter('duplicate_charges');
 
 export const options = {
   vus: Number(__ENV.VUS || 10),
   duration: __ENV.DURATION || '60s',
   thresholds: {
-    http_req_failed: ['rate<0.25'],
+    http_req_failed: ['rate<0.01'],
+    duplicate_charges: ['count==0'],
   },
 };
 
@@ -41,6 +44,11 @@ export default function () {
       shipping: { firstName: 'Load', lastName: 'Generator', address: '1 Workshop Way', city: 'Localhost', postalCode: '8088' },
     }, { ...tags, operation: 'checkout' });
     check(checkout, { 'checkout responds': response => response.status === 200 });
+    if (checkout.status === 200) {
+      const duplicateOf = checkout.json('payment.duplicateOf');
+      if (duplicateOf) duplicateCharges.add(1);
+      check(checkout, { 'payment is idempotent': () => !duplicateOf });
+    }
   }
 
   sleep(0.5);

@@ -6,7 +6,11 @@ const { randomUUID } = require('node:crypto');
 const port = Number(process.env.PORT || 8088);
 const paymentUrl = process.env.PAYMENT_URL || 'http://localhost:4004';
 const postgrestUrl = process.env.POSTGREST_URL || 'http://localhost:3000';
-const databasePool = [{}, {}];
+const databasePoolSize = 5;
+const databaseMaxWaiters = databasePoolSize * 4;
+const databaseAcquireTimeoutMs = 1000;
+let activeDatabaseConnections = 0;
+const databaseWaiters = [];
 const products = [
   { id: 'aurora-mug', name: 'Aurora Field Mug', description: 'A durable enamel mug for early starts and late ideas.', priceCents: 2400, category: 'Desk', emoji: '☕' },
   { id: 'signal-notebook', name: 'Signal Notebook', description: 'Dot-grid pages for diagrams, traces, and half-formed plans.', priceCents: 1800, category: 'Desk', emoji: '📓' },
@@ -18,20 +22,61 @@ const products = [
 
 const send = (res, status, value, type = 'application/json') => { res.writeHead(status, { 'content-type': type }); res.end(type === 'application/json' ? JSON.stringify(value) : value); };
 const readBody = req => new Promise((resolve, reject) => { let value = ''; req.on('data', chunk => { value += chunk; }); req.on('end', () => resolve(value ? JSON.parse(value) : {})); req.on('error', reject); });
-const database = async (url, options = {}) => {
-  const connection = databasePool.pop();
-  if (!connection) {
-    console.error(JSON.stringify({ event: 'database_pool_exhausted', poolSize: 2, databaseUrl: url }));
-    throw new Error('database connection pool exhausted');
+class DatabasePoolExhaustedError extends Error {
+  constructor(waitMs) {
+    super('database connection pool exhausted');
+    this.waitMs = waitMs;
   }
+}
+const releaseDatabaseConnection = () => {
+  const waiter = databaseWaiters.shift();
+  if (waiter) {
+    clearTimeout(waiter.timeout);
+    waiter.resolve();
+    return;
+  }
+  activeDatabaseConnections -= 1;
+};
+const acquireDatabaseConnection = url => {
+  const databaseRoute = new URL(url, postgrestUrl).pathname;
+  if (activeDatabaseConnections < databasePoolSize) {
+    activeDatabaseConnections += 1;
+    return Promise.resolve(() => releaseDatabaseConnection());
+  }
+  if (databaseWaiters.length >= databaseMaxWaiters) {
+    const waitMs = 0;
+    console.error(JSON.stringify({ event: 'database_pool_exhausted', poolSize: databasePoolSize, queueDepth: databaseWaiters.length, waitMs, databaseRoute }));
+    return Promise.reject(new DatabasePoolExhaustedError(waitMs));
+  }
+  const queuedAt = Date.now();
+  return new Promise((resolve, reject) => {
+    const waiter = {
+      resolve: () => resolve(() => releaseDatabaseConnection()),
+      timeout: null,
+    };
+    waiter.timeout = setTimeout(() => {
+      const index = databaseWaiters.indexOf(waiter);
+      if (index === -1) return;
+      databaseWaiters.splice(index, 1);
+      const waitMs = Date.now() - queuedAt;
+      console.error(JSON.stringify({ event: 'database_pool_exhausted', poolSize: databasePoolSize, queueDepth: databaseWaiters.length, waitMs, databaseRoute }));
+      reject(new DatabasePoolExhaustedError(waitMs));
+    }, databaseAcquireTimeoutMs);
+    databaseWaiters.push(waiter);
+  }).then(release => {
+    console.info(JSON.stringify({ event: 'database_pool_wait', poolSize: databasePoolSize, queueDepth: databaseWaiters.length, waitMs: Date.now() - queuedAt, databaseRoute }));
+    return release;
+  });
+};
+const database = async (url, options = {}) => {
+  const release = await acquireDatabaseConnection(url);
   try {
-    await new Promise(resolve => setTimeout(resolve, 250));
     const response = await fetch(`${postgrestUrl}${url}`, { ...options, headers: { accept: 'application/json', 'content-type': 'application/json', ...(options.headers || {}) } });
     const text = await response.text(); let data = null; try { data = text ? JSON.parse(text) : null; } catch { data = { message: text }; }
     if (!response.ok) throw new Error(data?.message || data?.details || `Database request failed: ${response.status}`);
     return data;
   } finally {
-    databasePool.push(connection);
+    release();
   }
 };
 const mapProduct = product => ({ ...product, priceCents: product.price_cents, price_cents: undefined });
@@ -54,7 +99,7 @@ async function route(req, res, url) {
     const totalCents = items.reduce((total, item) => total + item.product.priceCents * item.quantity, 0);
     const orderId = `order_${randomUUID().slice(0, 8)}`;
     const charge = attempt => {
-      const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 150);
+      const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 1000);
       return fetch(`${paymentUrl}/charge`, { method: 'POST', signal: controller.signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ amountCents: totalCents, email: input.email, orderId, attempt, cardLast4: input.cardNumber?.slice(-4) }) }).then(response => response.json()).finally(() => clearTimeout(timeout));
     };
     let payment;
@@ -71,4 +116,12 @@ async function route(req, res, url) {
   if (url.pathname === '/styles.css') return send(res, 200, fs.readFileSync(path.join(__dirname, 'frontend/styles.css'), 'utf8'), 'text/css');
   return send(res, 404, { error: 'Not found' });
 }
-http.createServer((req, res) => route(req, res, new URL(req.url, `http://${req.headers.host}`)).catch(error => { console.error(error); send(res, 500, { error: error.message }); })).listen(port, () => console.log(`shop API and frontend running at http://localhost:${port}`));
+http.createServer((req, res) => route(req, res, new URL(req.url, `http://${req.headers.host}`)).catch(error => {
+  if (error instanceof DatabasePoolExhaustedError) {
+    console.warn(JSON.stringify({ event: 'database_pool_saturated_response', status: 503, retryAfterSeconds: 1, waitMs: error.waitMs }));
+    res.setHeader('retry-after', '1');
+    return send(res, 503, { error: 'Database temporarily busy; retry shortly' });
+  }
+  console.error(error);
+  send(res, 500, { error: error.message });
+})).listen(port, () => console.log(`shop API and frontend running at http://localhost:${port}`));
